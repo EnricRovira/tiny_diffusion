@@ -51,11 +51,11 @@ def clean_text(df: pl.DataFrame):
 
     df = df.with_columns(
         pl.col('caption')
-        .map_elements(remove_dot_at_end),
+        .map_elements(remove_dot_at_end, return_dtype=pl.Utf8),
     )
     df = df.filter(
         (pl.col('caption').str.split(' ').list.len() >= 10) & 
-        (pl.col('caption').map_elements(starts_with_alnum))
+        (pl.col('caption').map_elements(starts_with_alnum, return_dtype=pl.Boolean))
     ).unique(subset=['caption'])
     return df
 
@@ -162,10 +162,13 @@ def download_imgs(df):
     path_out = f"{PATH}imgs"
     os.makedirs(f"{PATH}imgs", exist_ok=True)
     download(
-        processes_count=4,
+        processes_count=8,
         thread_count=8,
         url_list=f"{PATH}dataset_raw.parquet",
         image_size=256,
+        min_image_size=256,
+        resize_only_if_bigger=True,
+        resize_mode="no",
         output_folder=path_out,
         output_format="files",
         input_format="parquet",
@@ -179,10 +182,30 @@ def download_imgs(df):
     )
 
 
+def build_consolidated_data():
+    path_external_imgs = PATH + 'imgs/'
+    dataframes = []
+    for filename in os.listdir(path_external_imgs):
+        if filename.endswith(".parquet"):
+            parquet_path = os.path.join(path_external_imgs, filename)
+            path_shard = parquet_path.split('.')[:-1][0]
+            df = pl.read_parquet(parquet_path)
+            df = df.with_columns(
+                pl.col('key').map_elements(
+                    lambda x: os.path.join(path_shard, f'{x}.jpg'),
+                    return_dtype=pl.Utf8
+                ).alias("path")
+            )
+            dataframes.append(df)
+    df_final = pl.concat(dataframes).filter(pl.col('status')=='success')
+
+    return df_final
+
+
 def main():
     df = pl.read_parquet(
         PATH + "laion_0.parquet"
-    ).head(10_000)
+    ).head(20_000)
     logging.info(f'Step 1 - Loading data - Num records: {len(df)}')
 
     df = clean_sizes(df)
@@ -194,7 +217,7 @@ def main():
     df = clean_nsfw(df)
     logging.info(f'Step 4 - Clean NSFW - Num records: {len(df)}')
 
-    df = filter_top_k_percent(df, 'similarity', 0.4)
+    df = filter_top_k_percent(df, 'similarity', 0.35)
     logging.info(f'Step 5 - Get top K percent - Num records: {len(df)}')
 
     df = pos_filter(df, pos_bs=20_000, pos_max_workers=12)
@@ -205,6 +228,9 @@ def main():
     logging.info('Step 7- Downloading imgs...')
     download_imgs(df)
 
+    df = build_consolidated_data()
+    logging.info(f'Step 8- consolidating data - Num records: {len(df)}')
+    df.write_parquet(f"{PATH}/dataset_gold.parquet")
 
 
 if __name__ == "__main__":
