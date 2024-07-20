@@ -5,14 +5,24 @@ Prepare data
 import os
 import logging
 import re
-from concurrent.futures import ProcessPoolExecutor
-from functools import partial
-
+import shutil
+import io
+import numpy as np
+import base64
+import torch
 import polars as pl
-import spacy
-from img2dataset import download
+from PIL import Image
+from tqdm import tqdm
+import torchvision
+from torchvision.transforms.functional import InterpolationMode
+from torch.utils.data import Dataset, DataLoader
+from diffusers.image_processor import VaeImageProcessor
+from diffusers import AutoencoderKL, DDPMScheduler #type: ignore
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from streaming import MDSWriter, LocalDataset
 
 pl.Config.set_fmt_str_lengths(200)
+torch.cuda.empty_cache()
 
 #####################################################33
 
@@ -20,217 +30,165 @@ PATH = '/mnt/sd1tb/tinydiffusion/dataset_v0/'
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+DEVICE = "cuda" if torch.cuda.is_available() else None
+if not DEVICE:
+    logging.error('CUDA DEVICE NOT AVAILABLE') 
+
+#####################################################
+
+image_transforms = torchvision.transforms.Compose([
+    torchvision.transforms.Lambda(lambda img: img.convert('RGB')),
+    torchvision.transforms.Resize(256, interpolation=InterpolationMode.BICUBIC),
+    torchvision.transforms.RandomCrop(256),
+    torchvision.transforms.ToTensor(),
+    torchvision.transforms.Normalize([0.5], [0.5]),
+])
 
 
-def clean_sizes(df, ) -> pl.DataFrame:
-    return (
-        df.filter(
-            (pl.col('HEIGHT')>=256) &
-            (pl.col('WIDTH')>=256)
+class TinyDiffusionDataset(Dataset):
+    def __init__(self, dataframe, transform=None):
+        self.dataframe = dataframe
+        self.transform = transform
+        self.tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pile-t5-base", use_fast=True)
+        self.tokenizer.pad_token = self.tokenizer.bos_token
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        img_path = self.dataframe[idx, "path"]
+        caption = self.dataframe[idx, "caption"]
+        image = Image.open(img_path)
+
+        # Caption
+        caption = self.tokenizer(
+            caption, 
+            truncation=True,
+            max_length=77*3, 
+            padding="max_length", 
+            return_tensors="pt"
         )
-        .filter(
-            ~((pl.col('HEIGHT') > 2.4*pl.col('WIDTH')) | (pl.col('WIDTH') > 2.4*pl.col('HEIGHT')))
-        )
-        .filter(pl.col('NSFW').is_in({'UNLIKELY', 'UNSURE', 'False'}))
-        .rename({'SAMPLE_ID': 'id', 'URL': 'url', 'TEXT': 'caption'})
-        .with_columns([
-            pl.col('id').cast(pl.Utf8).alias('id')
-        ])
-        .unique(subset=['url'])
-    )
+        caption['input_ids'] = caption["input_ids"].squeeze() #type: ignore
+
+        # Image
+        if self.transform:
+            image = self.transform(image)
+
+        return {"idxs": idx, "image": image, "caption": caption}
 
 
-def clean_text(df: pl.DataFrame):
-    def remove_dot_at_end(text) -> str:
-        if text.endswith('.'):
-            return text[:-1]
-        return text
-    
-    def starts_with_alnum(text) -> bool:
-        return bool(re.match(r'^[A-Za-z0-9]', text))
-
-    df = df.with_columns(
-        pl.col('caption')
-        .map_elements(remove_dot_at_end, return_dtype=pl.Utf8),
-    )
-    df = df.filter(
-        (pl.col('caption').str.split(' ').list.len() >= 10) & 
-        (pl.col('caption').map_elements(starts_with_alnum, return_dtype=pl.Boolean))
-    ).unique(subset=['caption'])
-    return df
+def numpy_to_base64(array):
+    buffer = io.BytesIO()
+    np.save(buffer, array)
+    return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 
-def clean_nsfw(df: pl.DataFrame):
-    df = (
-        df.filter(
-            ~pl.col('caption').str.contains('fuck|shit|ass|bitch|cunt|dick|hell|pussy|tits|whore|motherfucker|nigger|bastard|slut') &
-            ~pl.col('caption').str.contains(
-                'sex|orgasm|masturbation|dick|vagina|naked|erotic|nude|penis|pornography|BDSM|fetish|blowjob|handjob|anal|threesome|orgy|gangbang|nudist|exhibitionist'
-            ) &
-            ~pl.col('caption').str.contains('weapon|gun|murder|violence|blood|gore|mutilation|torture|rape|decapitation|massacre|genocid|shooting|assault') &
-            ~pl.col('caption').str.contains('cocaine|heroin|marijuana|LSD|ecstasy|methamphetamine|crack|opium|ketamine|amphetamine|hallucinogen') &
-            ~pl.col('caption').str.contains('racist|sexist|homophobic|xenophobic|nazi|supremacist|intolerant|discrimination|hate speech') &
-            ~pl.col('caption').str.contains(
-                'suicide|self-harm|bulimia|anorexia|child abuse|domestic violence|human trafficking|incest|bestiality|necrophilia|sadomasochism|sexual assaul'
-            )
-        )
-    ).unique(subset=['caption'])
-    return df
+def process_batch(df, batch, vae, t5model, writer):
+    t5_inputs = {k: v.to(DEVICE) for k, v in batch['caption'].items()}
+    vae_input = batch['image'].to(DEVICE)
+    with torch.cuda.amp.autocast():
+        vae_output = vae.encode(vae_input).latent_dist.sample()
+        t5_outputs = t5model.encoder(**t5_inputs)[0]
+    t5_mask = t5_inputs["attention_mask"].permute(0, 2, 1).expand(t5_outputs.shape)
+    t5_pool = (t5_outputs * t5_mask).sum(1) / t5_mask.sum(dim=1)
 
-def filter_top_k_percent(
-    df: pl.DataFrame,
-    column: str,
-    k: float=0.5
-) -> pl.DataFrame:
-    k = 1 - k
-    limit_value = df[column].quantile(k)
-    df = df.filter(df[column] >= limit_value)
-    return df
+    # Format outputs
+    t5_outputs = t5_outputs.cpu().numpy()
+    t5_mask = t5_mask.cpu().numpy()
+    t5_pool = t5_pool.cpu().numpy()
+    vae_output = vae_output.cpu().numpy()
+    idxs = batch['idxs'].numpy()
+    df_chunk = df[idxs]
 
+    # Save output
+    samples = [
+        {
+            'id': row['id'],
+            'img': Image.open(row['path']),
+            'caption': row['caption'],
+            'original_width': row['original_width'],
+            'original_height': row['original_height'],
+            'width': row['width'],
+            'height': row['height'],
+            'vae_output': numpy_to_base64(vae_output[i]),
+            'vae_scaling_factor': vae.config.scaling_factor,
+            # 't5_output': numpy_to_base64(t5_outputs[i]),
+            # 't5_mask': numpy_to_base64(t5_mask[i]),
+            't5_pool': numpy_to_base64(t5_pool[i]),
+        }
+        for i, row in enumerate(df_chunk.iter_rows(named=True))
+    ]
 
-
-def pos_sanity_text_doc(doc):
-    try:
-        # Verificar si el primer token es un verbo
-        if doc[0].pos_ == 'VERB':
-            return False
-
-        # Tiene nombre
-        list_pos = [token.pos_ for token in doc]
-        tiene_nombre = any(t in {'NOUN'} for t in list_pos)
-        if not tiene_nombre:
-            return False
-
-        # Verificar la regla del adjetivo con ventana
-        cumple_regla_adj_nombre = True
-        # Verificar repetición de pronombres, adverbios, determinantes, etc.
-        cumple_regla_no_repetidos = True
-        tipos_prohibidos = {'PRON', 'ADV', 'DET'}
-        tipo_anterior = None
-        for i, token in enumerate(doc):
-            # Verificar la regla de adjetivo con ventana
-            if token.pos_ == 'ADJ':
-                ventana = doc[max(i-2, 0):min(i+3, len(doc))]
-                if not any(t.pos_ == 'NOUN' for t in ventana):
-                    cumple_regla_adj_nombre = False
-
-            # Verificar la repetición de tipos de palabras
-            if token.pos_ in tipos_prohibidos and token.pos_ == tipo_anterior:
-                cumple_regla_no_repetidos = False
-                break
-            tipo_anterior = token.pos_
-
-        if not cumple_regla_adj_nombre or not cumple_regla_no_repetidos:
-            return False
-
-        return True
-    except Exception as e:
-        return False
+    for sample in samples:
+        writer.write(sample)
 
 
-
-def pos_process_batch(batch, pos_model):
-    model = spacy.load(pos_model, disable=["lemmatizer", "senter", "ner"])
-    docs = model.pipe(batch)
-    return [(doc.text, pos_sanity_text_doc(doc)) for doc in docs]
-
-
-def pos_filter(
-    df: pl.DataFrame,
-    pos_bs=10,
-    pos_max_workers=2,
-    pos_model='en_core_web_sm'
+def prepare_data(
+    df_train,
+    df_val, 
+    path_output_dataset
 ):
-    texts = df['caption'].to_list()
-    batches = [texts[i:i + pos_bs] for i in range(0, len(texts), pos_bs)]
+    columns = {
+        'id': 'str',
+        'img': 'jpeg',
+        'caption': 'str',
+        'original_width': 'int',
+        'original_height': 'int',
+        'width': 'int',
+        'height': 'int',
+        'vae_output': 'str',
+        'vae_scaling_factor': 'float32',
+        # 't5_output': 'str',
+        # 't5_mask': 'str',
+        't5_pool': 'str',
+    }
 
-    process_with_args = partial(pos_process_batch, pos_model=pos_model)
-    with ProcessPoolExecutor(pos_max_workers) as executor:
-        results = executor.map(process_with_args, batches)
+    # Load model and data
+    vae = AutoencoderKL.from_pretrained("ostris/vae-kl-f8-d16", torch_dtype=torch.float16).to(DEVICE) #type: ignore
+    _ = vae.requires_grad_(False)
+    t5model = AutoModelForSeq2SeqLM.from_pretrained("EleutherAI/pile-t5-base", torch_dtype=torch.float16).to(DEVICE)
+    t5model.requires_grad_(False)
+    train_dataset = TinyDiffusionDataset(df_train, transform=image_transforms)
+    val_dataset = TinyDiffusionDataset(df_val, transform=image_transforms)
+    train_dataloader = DataLoader(train_dataset, batch_size=100, pin_memory=True, num_workers=12)
+    val_dataloader = DataLoader(val_dataset, batch_size=100, pin_memory=True, num_workers=12)
 
-    processed_data = [item[-1] for sublist in results for item in sublist]
-    df = (
-        df.with_columns(
-            pl.Series('flag_pos', processed_data)
-        ).filter(
-            pl.col('flag_pos') == True
-        ).drop('flag_pos')
-    )
-    return df
-
-def download_imgs(df):
-    path_out = f"{PATH}imgs"
-    os.makedirs(f"{PATH}imgs", exist_ok=True)
-    download(
-        processes_count=8,
-        thread_count=8,
-        url_list=f"{PATH}dataset_raw.parquet",
-        image_size=256,
-        min_image_size=256,
-        resize_only_if_bigger=True,
-        resize_mode="no",
-        output_folder=path_out,
-        output_format="files",
-        input_format="parquet",
-        url_col="url",
-        caption_col="caption",
-        save_additional_columns=['id'],
-        enable_wandb=False,
-        number_sample_per_shard=1_000,
-        encode_format='jpg',
-        encode_quality=95,
-    )
+    # Generate outputs
+    logging.info('Processng train...')
+    with MDSWriter(
+        out=path_output_dataset + 'train/', columns=columns, max_workers=16,
+        exist_ok=True, progress_bar=True, size_limit=1 << 29
+    ) as out:
+        # Train
+        for batch in tqdm(train_dataloader):
+            process_batch(df_train, batch, vae, t5model, out)
+    logging.info('Processng validation...')
+    with MDSWriter(
+        out=path_output_dataset + 'val/', columns=columns, max_workers=16,
+        exist_ok=True, progress_bar=True, size_limit=1 << 29
+    ) as out:
+        # Val
+        for batch in tqdm(val_dataloader):
+            process_batch(df_val, batch, vae, t5model, out)
+            
 
 
-def build_consolidated_data():
-    path_external_imgs = PATH + 'imgs/'
-    dataframes = []
-    for filename in os.listdir(path_external_imgs):
-        if filename.endswith(".parquet"):
-            parquet_path = os.path.join(path_external_imgs, filename)
-            path_shard = parquet_path.split('.')[:-1][0]
-            df = pl.read_parquet(parquet_path)
-            df = df.with_columns(
-                pl.col('key').map_elements(
-                    lambda x: os.path.join(path_shard, f'{x}.jpg'),
-                    return_dtype=pl.Utf8
-                ).alias("path")
-            )
-            dataframes.append(df)
-    df_final = pl.concat(dataframes).filter(pl.col('status')=='success')
-
-    return df_final
-
+def build_splits(df):
+    idxs = np.arange(len(df))
+    np.random.shuffle(idxs)
+    tr_idxs, val_idxs = idxs[:-200], idxs[-200:]
+    df_train, df_val = df[tr_idxs], df[val_idxs]
+    assert len(tr_idxs) + len(val_idxs) == len(df), "sizes of splits dont match"
+    return df_train, df_val
 
 def main():
-    df = pl.read_parquet(
-        PATH + "laion_0.parquet"
-    ).head(20_000)
-    logging.info(f'Step 1 - Loading data - Num records: {len(df)}')
-
-    df = clean_sizes(df)
-    logging.info(f'Step 2 - Clean sizes- Num records: {len(df)}')
-
-    df = clean_text(df)
-    logging.info(f'Step 3 - Clean text - Num records: {len(df)}')
-
-    df = clean_nsfw(df)
-    logging.info(f'Step 4 - Clean NSFW - Num records: {len(df)}')
-
-    df = filter_top_k_percent(df, 'similarity', 0.35)
-    logging.info(f'Step 5 - Get top K percent - Num records: {len(df)}')
-
-    df = pos_filter(df, pos_bs=20_000, pos_max_workers=12)
-    logging.info(f'Step 6 - POS filter - Num records: {len(df)}')
-
-    df.write_parquet(f"{PATH}/dataset_raw.parquet")
-
-    logging.info('Step 7- Downloading imgs...')
-    download_imgs(df)
-
-    df = build_consolidated_data()
-    logging.info(f'Step 8- consolidating data - Num records: {len(df)}')
-    df.write_parquet(f"{PATH}/dataset_gold.parquet")
+    path_output_dataset = PATH + 'dataset/'
+    df = pl.read_parquet(PATH + 'dataset_gold.parquet')
+    df_train, df_val = build_splits(df)
+    logging.info(
+        f'Starting generation - Records all: {len(df)} - train_records: {len(df_train)} - val_records: {len(df_val)}'
+    )
+    prepare_data(df_train, df_val, path_output_dataset)
 
 
 if __name__ == "__main__":
