@@ -169,9 +169,6 @@ temp/
 
 # Custom
 ecishopper_embeddings/models/notebooks/logs
-*_logs*
+*_logs/*
 *wandb*
 *artifacts*
-*ecishopper_embeddings/models/model_catalogue/benchmark/tmp*
-*ecishopper_embeddings/models/model_catalogue/benchmark/results*
-ecishopper_embeddings/models/model_catalogue/benchmark/testing/data/*
