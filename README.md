@@ -2,10 +2,19 @@
 
 Dudas:
 
-- se redimensiona todo a imagen cuadrado y se hace finalmente finetunning con diferentes aspect ratios?
 - como usar rectified flow??
-- usar torch.compile
-- en todas las epocs tiene que mostrarme imagenes de ejemplo.
 - pasar todas las configs a parámetros
-- proceso inferencia
-- poner checkpointing como param
+----
+si el bs es 128, puedo usar un lr de 3e-4?
+----
+revisar la inicalizacion de params
+----
+add % unconditional (empty text)
+----
+multi scale loss
+----
+ema saving model
+----
+gradient accumulation para subir el batch_size efectivo?
+aumentar el text encoder al modelo large?
+

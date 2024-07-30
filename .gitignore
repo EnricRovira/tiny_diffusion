@@ -169,6 +169,7 @@ temp/
 
 # Custom
 ecishopper_embeddings/models/notebooks/logs
-*_logs/*
-*wandb*
+*logs/*
+*wandb/*
 *artifacts*
+*epoch=*
