@@ -64,7 +64,7 @@ class TinyDiffusionDataset(Dataset):
         caption = self.tokenizer(
             caption, 
             truncation=True,
-            max_length=77*3, 
+            max_length=128, 
             padding="max_length", 
             return_tensors="pt"
         )

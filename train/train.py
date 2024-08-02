@@ -2,6 +2,7 @@
 from dotenv import load_dotenv
 import sys
 import os
+import random
 import logging
 from streaming import MDSWriter, LocalDataset, StreamingDataset
 import base64 
@@ -17,11 +18,14 @@ from torch.utils.data import Dataset, DataLoader
 from dataclasses import asdict
 from datetime import datetime
 from torchvision.transforms.functional import InterpolationMode
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 load_dotenv()
 
 from model.model import DiT_Llama
 from model.trainer import Trainer, LogPredictionsCallback
 import warnings
+
+os.environ['TOKENIZERS_PARALLELISM'] = "False"
 
 #####################################################33
 
@@ -49,8 +53,33 @@ def base64_to_numpy(base64_str):
     return array
 
 
+def get_uncond_emb():
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pile-t5-base", use_fast=True)
+    tokenizer.pad_token = tokenizer.bos_token
+    t5model = AutoModelForSeq2SeqLM.from_pretrained("EleutherAI/pile-t5-base", torch_dtype=torch.float16).to(DEVICE)
+    t5model.requires_grad_(False)
+    uncond_caption = tokenizer(
+        [""],   
+        truncation=True,
+        max_length=128, 
+        padding="max_length", 
+        return_tensors="pt"
+    )
+    uncond_caption['attention_mask'] = uncond_caption["attention_mask"].unsqueeze(0) #type: ignore
+    inputs = {k: v.to(DEVICE) for k, v in uncond_caption.items()}
+    with torch.amp.autocast(DEVICE), torch.inference_mode(): #type: ignore
+        out = t5model.encoder(**inputs)[0]
+    out_mask = inputs["attention_mask"].permute(0, 2, 1).expand(out.shape)
+    out = (out * out_mask).float().cpu().numpy()
+
+    del t5model
+    torch.cuda.empty_cache()
+
+    return out[0, :, :]
+
+
 class MosaicDataset(StreamingDataset):
-    def __init__(self, local, batch_size=1, shuffle=False):
+    def __init__(self, local, batch_size=1, shuffle=False, prob_uncond: float=0.1):
         super().__init__(
             local=local, batch_size=batch_size, 
             predownload=16*batch_size, 
@@ -59,6 +88,9 @@ class MosaicDataset(StreamingDataset):
             shuffle_block_size=1 << 18,
             keep_zip=False
         )
+        self.prob_uncond = prob_uncond
+        self.uncond_emb = get_uncond_emb()
+        
 
     def __getitem__(self, idx):
         data = super().__getitem__(idx)
@@ -66,10 +98,14 @@ class MosaicDataset(StreamingDataset):
         # data['t5_pool'] = base64_to_numpy(data['t5_pool'])
         # data['t5_output'] = data['t5_output']
         # data['vae_output'] = data['vae_output']
+        if random.random() <= self.prob_uncond:
+            text_encoder = self.uncond_emb
+
+        else:
+            text_encoder = data['t5_output'][:128, :]
         return {
-            # 'img': data['img'], 
             'vae': data['vae_output'], 
-            'text_encoder': data['t5_output'],
+            'text_encoder': text_encoder,
             'caption': data['caption']
         }
     
@@ -84,7 +120,7 @@ def run_training(args):
         torch.backends.cudnn.allow_tf32 = True
 
     # Get data
-    bs = 128
+    bs = 192
     train_dataset = MosaicDataset(local=PATH + 'dataset/train/', batch_size=bs, shuffle=False)
     val_dataset = MosaicDataset(local=PATH + 'dataset/val/', batch_size=bs, shuffle=False)
     train_dataloader = DataLoader(
@@ -130,7 +166,7 @@ def run_training(args):
     lr_monitor_callback = LearningRateMonitor(logging_interval='step')
     log_image_callback = LogPredictionsCallback(val_dataloader=val_dataloader)
     checkpoint_callback = ModelCheckpoint(
-        every_n_epochs=1, 
+        every_n_epochs=2, 
         save_on_train_epoch_end=True, 
         dirpath=log_base_path
     )
@@ -140,7 +176,7 @@ def run_training(args):
         # limit_train_batches=20,
         devices=1, 
         logger=logger,
-        log_every_n_steps=30,
+        log_every_n_steps=50,
         callbacks=callbacks, #type: ignore
         precision='16-mixed',
         accumulate_grad_batches=1,

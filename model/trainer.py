@@ -62,7 +62,7 @@ class Trainer(L.LightningModule):
         self.loss_fn = torch.nn.MSELoss()
 
     def configure_optimizers(self):  
-        lr, wd = 2e-4, 0.1
+        lr, wd = 7e-5, 0.01
         optimizer = torch.optim.AdamW( #type: ignore
             params=self.parameters(),
             lr=lr, 
@@ -74,7 +74,7 @@ class Trainer(L.LightningModule):
         lr_scheduler = CosineWarmupScheduler(
             optimizer, 
             lr, 
-            warmup_length=int(0.1*(self.trainer.estimated_stepping_batches)), 
+            warmup_length=2500,#int(0.01*(self.trainer.estimated_stepping_batches)), 
             total_steps=self.trainer.estimated_stepping_batches,
         )
 
@@ -151,7 +151,7 @@ class Trainer(L.LightningModule):
 
 
 class LogPredictionsCallback(Callback):
-    def __init__(self, val_dataloader, num_imgs=8, num_inference_steps=25):
+    def __init__(self, val_dataloader, num_imgs=8, num_inference_steps=30):
         super().__init__()
         self.val_dataloader = val_dataloader
         self.num_imgs = num_imgs

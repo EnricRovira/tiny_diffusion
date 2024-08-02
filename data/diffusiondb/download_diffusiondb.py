@@ -12,9 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 base_url = "https://huggingface.co/datasets/poloclub/diffusiondb/resolve/main/images/part-"
 path_data='/mnt/sd1tb/tinydiffusion/'
 name_dataset='dataset_v1'
-diffusion_db_partitions = 800
+diffusion_db_partitions = 900
 out_dir = os.path.join(path_data, name_dataset, "diffusiondb")
-parallel_downloads = 8
+parallel_downloads = 10
 
 os.makedirs(out_dir, exist_ok=True)
 
@@ -37,8 +37,9 @@ def download_and_unzip(part_id):
 
 
 def main():
+    print("Started")
     start = time.time()
-    part_ids = range(1, diffusion_db_partitions + 1)
+    part_ids = range(664, diffusion_db_partitions + 1)
     with ThreadPoolExecutor(max_workers=parallel_downloads) as executor:
         executor.map(download_and_unzip, part_ids)
     elapsed = time.time() - start

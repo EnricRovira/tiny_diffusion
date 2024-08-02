@@ -17,9 +17,9 @@ class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size),
+            nn.Linear(frequency_embedding_size, hidden_size, bias=False),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(hidden_size, hidden_size, bias=False),
         )
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -77,6 +77,21 @@ class MultiHeadLayerNorm(nn.Module):
     
 
 
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+    
+
+
 class Fp32LayerNorm(nn.LayerNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -93,69 +108,69 @@ class Fp32LayerNorm(nn.LayerNorm):
 
 
 
-class Attention(nn.Module):
-    def __init__(self, dim, n_heads):
-        super().__init__()
+# class Attention(nn.Module):
+#     def __init__(self, dim, n_heads):
+#         super().__init__()
 
-        self.n_heads = n_heads
-        self.n_rep = 1
-        self.head_dim = dim // n_heads
+#         self.n_heads = n_heads
+#         self.n_rep = 1
+#         self.head_dim = dim // n_heads
 
-        self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+#         self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+#         self.wk = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
+#         self.wv = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
+#         self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)
 
-        self.q_norm = nn.LayerNorm(self.n_heads * self.head_dim)
-        self.k_norm = nn.LayerNorm(self.n_heads * self.head_dim)
+#         self.q_norm = nn.LayerNorm(self.n_heads * self.head_dim)
+#         self.k_norm = nn.LayerNorm(self.n_heads * self.head_dim)
 
-    @staticmethod
-    def reshape_for_broadcast(freqs_cis, x):
-        ndim = x.ndim
-        assert 0 <= 1 < ndim
-        # assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-        _freqs_cis = freqs_cis[: x.shape[1]]
-        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-        return _freqs_cis.view(*shape)
+#     @staticmethod
+#     def reshape_for_broadcast(freqs_cis, x):
+#         ndim = x.ndim
+#         assert 0 <= 1 < ndim
+#         # assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+#         _freqs_cis = freqs_cis[: x.shape[1]]
+#         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+#         return _freqs_cis.view(*shape)
 
-    @staticmethod
-    def apply_rotary_emb(xq, xk, freqs_cis):
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis_xq = Attention.reshape_for_broadcast(freqs_cis, xq_)
-        freqs_cis_xk = Attention.reshape_for_broadcast(freqs_cis, xk_)
+#     @staticmethod
+#     def apply_rotary_emb(xq, xk, freqs_cis):
+#         xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+#         xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+#         freqs_cis_xq = Attention.reshape_for_broadcast(freqs_cis, xq_)
+#         freqs_cis_xk = Attention.reshape_for_broadcast(freqs_cis, xk_)
 
-        xq_out = torch.view_as_real(xq_ * freqs_cis_xq).flatten(3)
-        xk_out = torch.view_as_real(xk_ * freqs_cis_xk).flatten(3)
-        return xq_out, xk_out
+#         xq_out = torch.view_as_real(xq_ * freqs_cis_xq).flatten(3)
+#         xk_out = torch.view_as_real(xk_ * freqs_cis_xk).flatten(3)
+#         return xq_out, xk_out
 
-    def forward(self, x, freqs_cis):
-        bsz, seqlen, _ = x.shape
+#     def forward(self, x, freqs_cis):
+#         bsz, seqlen, _ = x.shape
 
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+#         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        dtype = xq.dtype
+#         dtype = xq.dtype
 
-        xq = self.q_norm(xq)
-        xk = self.k_norm(xk)
+#         xq = self.q_norm(xq)
+#         xk = self.k_norm(xk)
 
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_heads, self.head_dim)
+#         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+#         xk = xk.view(bsz, seqlen, self.n_heads, self.head_dim)
+#         xv = xv.view(bsz, seqlen, self.n_heads, self.head_dim)
 
-        xq, xk = self.apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        xq, xk = xq.to(dtype), xk.to(dtype)
+#         xq, xk = self.apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+#         xq, xk = xq.to(dtype), xk.to(dtype)
 
-        output = F.scaled_dot_product_attention(
-            xq.permute(0, 2, 1, 3),
-            xk.permute(0, 2, 1, 3),
-            xv.permute(0, 2, 1, 3),
-            dropout_p=0.0,
-            is_causal=False,
-        ).permute(0, 2, 1, 3)
-        output = output.flatten(-2)
+#         output = F.scaled_dot_product_attention(
+#             xq.permute(0, 2, 1, 3),
+#             xk.permute(0, 2, 1, 3),
+#             xv.permute(0, 2, 1, 3),
+#             dropout_p=0.0,
+#             is_causal=False,
+#         ).permute(0, 2, 1, 3)
+#         output = output.flatten(-2)
 
-        return self.wo(output)
+#         return self.wo(output)
     
 
 
@@ -181,23 +196,23 @@ class DoubleAttention(nn.Module):
         self.q_norm1 = (
             MultiHeadLayerNorm((self.n_heads, self.head_dim))
             if mh_qknorm
-            else Fp32LayerNorm(self.head_dim, bias=False, elementwise_affine=False)
+            else RMSNorm(self.head_dim) #Fp32LayerNorm(self.head_dim, bias=False, elementwise_affine=False)
         )
         self.k_norm1 = (
             MultiHeadLayerNorm((self.n_heads, self.head_dim))
             if mh_qknorm
-            else Fp32LayerNorm(self.head_dim, bias=False, elementwise_affine=False)
+            else RMSNorm(self.head_dim) #Fp32LayerNorm(self.head_dim, bias=False, elementwise_affine=False)
         )
 
         self.q_norm2 = (
             MultiHeadLayerNorm((self.n_heads, self.head_dim))
             if mh_qknorm
-            else Fp32LayerNorm(self.head_dim, bias=False, elementwise_affine=False)
+            else RMSNorm(self.head_dim) #Fp32LayerNorm(self.head_dim, bias=False, elementwise_affine=False)
         )
         self.k_norm2 = (
             MultiHeadLayerNorm((self.n_heads, self.head_dim))
             if mh_qknorm
-            else Fp32LayerNorm(self.head_dim, bias=False, elementwise_affine=False)
+            else RMSNorm(self.head_dim) #Fp32LayerNorm(self.head_dim, bias=False, elementwise_affine=False)
         )
 
 
@@ -214,8 +229,8 @@ class DoubleAttention(nn.Module):
     def apply_rotary_emb(xq, xk, freqs_cis):
         xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
         xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis_xq = Attention.reshape_for_broadcast(freqs_cis, xq_)
-        freqs_cis_xk = Attention.reshape_for_broadcast(freqs_cis, xk_)
+        freqs_cis_xq = DoubleAttention.reshape_for_broadcast(freqs_cis, xq_)
+        freqs_cis_xk = DoubleAttention.reshape_for_broadcast(freqs_cis, xk_)
 
         xq_out = torch.view_as_real(xq_ * freqs_cis_xq).flatten(3)
         xk_out = torch.view_as_real(xk_ * freqs_cis_xk).flatten(3)
@@ -264,11 +279,11 @@ class DoubleAttention(nn.Module):
     
 
 
-
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
         return n
     return n + k - (n % k)
+
 
 
 class MLP(nn.Module):
@@ -295,8 +310,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, dim, heads=8, global_conddim=1024, is_last=False):
         super().__init__()
 
-        self.normC1 = Fp32LayerNorm(dim, elementwise_affine=False, bias=False)
-        self.normC2 = Fp32LayerNorm(dim, elementwise_affine=False, bias=False)
+        self.normC1 = RMSNorm(dim) #Fp32LayerNorm(dim, elementwise_affine=False, bias=False)
+        self.normC2 = RMSNorm(dim) #Fp32LayerNorm(dim, elementwise_affine=False, bias=False)
         if not is_last:
             self.mlpC = MLP(dim, hidden_dim=dim * 4)
             self.modC = nn.Sequential(
@@ -309,8 +324,8 @@ class TransformerBlock(nn.Module):
                 nn.Linear(global_conddim, 2 * dim, bias=False),
             )
 
-        self.normX1 = Fp32LayerNorm(dim, elementwise_affine=False, bias=False)
-        self.normX2 = Fp32LayerNorm(dim, elementwise_affine=False, bias=False)
+        self.normX1 = RMSNorm(dim) #Fp32LayerNorm(dim, elementwise_affine=False, bias=False)
+        self.normX2 = RMSNorm(dim) #Fp32LayerNorm(dim, elementwise_affine=False, bias=False)
         self.mlpX = MLP(dim, hidden_dim=dim * 4)
         self.modX = nn.Sequential(
             nn.SiLU(),
@@ -334,8 +349,6 @@ class TransformerBlock(nn.Module):
         xshift_msa, xscale_msa, xgate_msa, xshift_mlp, xscale_mlp, xgate_mlp = (
             self.modX(global_cond).chunk(6, dim=1)
         )
-        # print(len(x), len(xshift_msa), len(xscale_msa))
-        # print(x.size(), xshift_msa.size(), xscale_msa.size())
         x = modulate(self.normX1(x), xshift_msa, xscale_msa)
 
         # attention
@@ -353,25 +366,25 @@ class TransformerBlock(nn.Module):
         return c, x
 
 
-class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, patch_size, out_channels):
-        super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(
-            hidden_size, patch_size * patch_size * out_channels, bias=False
-        )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(min(hidden_size, 1024), 2 * hidden_size, bias=False),
-        )
-        # # init zero
-        nn.init.constant_(self.linear.weight, 0)
+# class FinalLayer(nn.Module):
+#     def __init__(self, hidden_size, patch_size, out_channels):
+#         super().__init__()
+#         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+#         self.linear = nn.Linear(
+#             hidden_size, patch_size * patch_size * out_channels, bias=False
+#         )
+#         self.adaLN_modulation = nn.Sequential(
+#             nn.SiLU(),
+#             nn.Linear(min(hidden_size, 1024), 2 * hidden_size, bias=False),
+#         )
+#         # # init zero
+#         nn.init.constant_(self.linear.weight, 0)
 
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
-        return x
+#     def forward(self, x, c):
+#         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+#         x = modulate(self.norm_final(x), shift, scale)
+#         x = self.linear(x)
+#         return x
 
 
 class DiT_Llama(nn.Module):
@@ -387,7 +400,6 @@ class DiT_Llama(nn.Module):
         cap_feat_dim=768
     ):
         super().__init__()
-
         self.global_cond_dim = min(dim, 1024)
         self.in_channels = in_channels
         self.out_channels = in_channels
@@ -395,15 +407,20 @@ class DiT_Llama(nn.Module):
         self.patch_size = patch_size
 
         self.init_x_linear = nn.Linear(
-            patch_size * patch_size * in_channels, dim
-        )  # init linear for patchified image.
+            patch_size * patch_size * in_channels, dim, 
+            bias=False
+        )
 
-        self.x_embedder = nn.Linear(patch_size * patch_size * dim // 2, dim, bias=False)
+        self.x_embedder = nn.Linear(
+            patch_size * patch_size * dim // 2, dim, 
+            bias=False
+        )
         nn.init.constant_(self.x_embedder.weight, 0)
 
         self.t_embedder = TimestepEmbedder(self.global_cond_dim)
         self.cap_embedder = nn.Linear(
-            cap_feat_dim, self.global_cond_dim, bias=False,
+            cap_feat_dim, self.global_cond_dim, 
+            bias=False,
         )
         nn.init.constant_(self.cap_embedder.weight, 0)
 
@@ -418,18 +435,24 @@ class DiT_Llama(nn.Module):
                 for layer_id in range(n_layers)
             ]
         )
-        self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
+        self.final_linear = nn.Linear(
+            dim, patch_size * patch_size * in_channels, bias=False
+        )
         self.positional_encoding = nn.Parameter(torch.randn(1, max_seq, dim) * 0.1)
-        self.register_tokens = nn.Parameter(torch.randn(1, 8, dim) * 0.02)
         self.h_max = int(max_seq**0.5)
         self.w_max = int(max_seq**0.5)
+
+        for pn, p in self.named_parameters():
+            if ".mod" in pn:
+                nn.init.constant_(p, 0)
+            if p.requires_grad:
+                print(f"{pn} - {p.numel()}")
 
 
     @torch.no_grad()
     def extend_pe(self, init_dim=(16, 16), target_dim=(64, 64)):
         # extend pe
         pe_data = self.positional_encoding.data.squeeze(0)[: init_dim[0] * init_dim[1]]
-
         pe_as_2d = pe_data.view(init_dim[0], init_dim[1], -1).permute(2, 0, 1)
 
         # now we need to extend this to target_dim. for this we will use interpolation.
@@ -478,20 +501,19 @@ class DiT_Llama(nn.Module):
 
     def forward(self, x, t, caption):
         b, c, h, w = x.shape
-
+        # w conv -> torch.Size([2, 256, 768])
+        # wo conv -> torch.Size([2, 256, 64])
         x = self.init_x_linear(self.patchify(x)) # B, T_x, D
         x = x + self.positional_encoding[:, :x.size(1)]
 
         t = self.t_embedder(t)  # (N, D)
         cap = self.cap_embedder(caption)  # (N, T, D)
-        cap = torch.cat([
-            self.register_tokens.repeat(b, 1, 1),
-            cap
-        ], dim=1)
+        cap_pool = cap.mean(dim=1)
+        global_cond = t + cap_pool
         for idx, layer in enumerate(self.layers):
-            cap, x = layer(cap, x, t,)
+            cap, x = layer(cap, x, global_cond)
 
-        x = self.final_layer(x, t)
+        x = self.final_linear(x)
         x = self.unpatchify(x, h // self.patch_size, w // self.patch_size)  # (N, out_channels, H, W)
         return x
 
@@ -519,18 +541,16 @@ def DiT_Llama_S(**kwargs):
     return DiT_Llama(in_channels=16, patch_size=2, dim=384, n_layers=12, n_heads=6, **kwargs)
 
 def DiT_Llama_B(**kwargs):
-    return DiT_Llama(in_channels=16, patch_size=2, dim=768, n_layers=12, n_heads=12, **kwargs)
+    return DiT_Llama(in_channels=16, patch_size=2, dim=528, n_layers=12, n_heads=12, **kwargs)
 
 if __name__ == "__main__":
     model = DiT_Llama_S()
     model.eval()
     print(f"Num parameters: {sum(p.numel() for p in model.parameters())}")
-    x = torch.randn(2, 16, 32, 32)
+    x = torch.randn(2, 4, 32, 32)
     t = torch.randint(0, 1000, (2,))
-    cap = torch.randn(2, 234, 768)
+    cap = torch.randn(2, 128, 768)
 
     with torch.no_grad():
         out = model(x, t, cap)
-        print(out.shape)
-        out = model.forward_with_cfg(x, t, cap, 0.5)
         print(out.shape)
