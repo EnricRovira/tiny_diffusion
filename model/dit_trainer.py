@@ -156,9 +156,6 @@ def forward(
     caption_encoded = caption_encoded * mask
     caption_encoded[caption_encoded == 0] = 0
 
-    # assert vae_latent.device == device, f"Device: {vae_latent.device}, expected: {device}"
-    # assert vae_latent.dtype == torch.float32, f"Dtype: {vae_latent.dtype}, expected: torch.float32"
-    # assert caption_encoded.device == device, f"Device: {caption_encoded.device}, expected: {device}"
     assert caption_encoded.dtype in {torch.float16, torch.bfloat16}, f"Dtype: {caption_encoded.dtype}, expected: torch.float16 or torch.bfloat16"
     batch_size = vae_latent.size(0)
 
@@ -166,47 +163,14 @@ def forward(
     vae_latent = (vae_latent - vae_model.config.shift_factor) * vae_model.config.scaling_factor
     vae_latent = vae_latent.to(torch.bfloat16)
 
-    # log normal sample
-    # z = torch.randn(
-    #     batch_size, device=device, dtype=torch.bfloat16, generator=generator
-    # )
-    # t = torch.nn.Sigmoid()(z)
 
     if CAPTURE_INPUT and global_step == 0:
         torch.save(vae_latent, f"test_data/vae_latent_{global_step}.pt")
         torch.save(caption_encoded, f"test_data/caption_encoded_{global_step}.pt")
         # torch.save(t, f"test_data/timesteps_{global_step}.pt")
 
-    # noise = torch.randn(
-    #     vae_latent.shape, device=device, dtype=torch.bfloat16, generator=generator
-    # )
     with ctx:
-        # Forward pass
-        # tr = t.reshape(batch_size, 1, 1, 1)
-        # z_t = vae_latent * (1 - tr) + noise * tr
-        # v_objective = vae_latent - noise
-        # output = dit_model(z_t, caption_encoded, t)
         loss, outputs = diffusion_model(vae_latent, caption_encoded)
-        # print(outputs['batchwise_loss'])
-        
-
-        # diffusion_loss_batchwise = (
-        #     (v_objective.float() - output.float()).pow(2).mean(dim=(1, 2, 3))
-        # )
-        # total_loss = diffusion_loss_batchwise.mean()
-
-        # timestep binning
-        # if binnings is not None:
-        #     (
-        #         diffusion_loss_binning,
-        #         diffusion_loss_binning_count,
-        #     ) = binnings
-        #     for element in outputs["batchwise_loss"]:
-        #         tv, tloss = element
-        #         tv = torch.nn.Sigmoid()(tv).cpu().item()
-        #         diffusion_loss_binning[tv] += tloss
-        #         diffusion_loss_binning_count[tv] += 1
-        # raise ValueError('STOP!!')
     return loss
 
 def save_weights(logger, path_checkpoints, run_name, global_step, diffusion_model):
@@ -470,9 +434,7 @@ def train(
                     f"Step [{global_step}/{max_steps}] "
                     f"Loss: {total_loss:.4f} "
                     f"Datapoints: {global_step * batch_size} "
-                    # f"(Diff: {diffusion_loss:.4f}, "
                     f"LR: {lr_scheduler.get_last_lr()[0]:.6f}"
-                    # f"\nDiffusion Per-timestep-binned:\n{diffusion_per_timestep}"
                 )
                 diffusion_loss_binning = {k: 0 for k in range(10)}
                 diffusion_loss_binning_count = {k: 0 for k in range(10)}
