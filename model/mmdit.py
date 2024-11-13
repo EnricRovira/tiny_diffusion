@@ -529,8 +529,6 @@ def test_model():
     )
 
     model.to(device, dtype=dtype)
-    # model = torch.compile(model, backend='inductor', dynamic=True)
-    # model = torch.compile(model, mode="max-autotune")
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {param_count / 1e6 :.4f} M")
