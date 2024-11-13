@@ -1,4 +1,4 @@
-# Tiny diffusion 
+# Tiny Rectified Flow Diffusion 
 
 ![Grid sample](./assets/grid_sample.png)
 This repository contains essential scripts and commands for training a diffusion model using the PD3M dataset. Below, you'll find step-by-step instructions for setting up, preparing your data, and training your model, along with some useful optimization tips.
@@ -69,6 +69,10 @@ To start training your diffusion model, use:
 python3 -m model.dit_trainer
 ```
 This script initializes the model training loop. You can tune the training parameters in the ```trainer.py``` script.
+
+# Inference
+
+You can find the inference script sample in the ```model/infer_mmdit.ipynb``` file.
 
 # Acknowledgments
 
