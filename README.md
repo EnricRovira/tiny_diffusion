@@ -19,6 +19,8 @@ The model of the image was trained with:
 # Data
 I used the PD3M dataset, you can download the dataset from [here](https://huggingface.co/datasets/Spawning/PD3M).
 
+You can donwload image, captions pairs
+
 # Logging
 
 I used wandb to log the training process. Its a very useful tool to monitor the training process and to compare the training of different models.
